@@ -11,15 +11,15 @@ from datetime import datetime
 from typing import List, Dict, Any
 import csv
 
-# You'll need to install these: pip install web3 requests pandas matplotlib
+# You'll need to install these: pip install genlayer-py web3 requests pandas matplotlib
 try:
-    from web3 import Web3
+    from genlayer_py import create_client, create_account, testnet_asimov
     import requests
     import pandas as pd
     import matplotlib.pyplot as plt
 except ImportError:
     print("Please install required packages:")
-    print("pip install web3 requests pandas matplotlib")
+    print("pip install genlayer-py web3 requests pandas matplotlib")
     exit(1)
 
 
@@ -28,23 +28,40 @@ class IntelligentContractBenchmark:
     Main benchmarking class for testing Intelligent Contract performance
     """
     
-    def __init__(self, rpc_url: str, contract_address: str, private_key: str):
+    def __init__(self, contract_address: str, private_key: str = None, chain_config=None):
         """
         Initialize benchmark suite
         
         Args:
-            rpc_url: Gen Layer testnet RPC endpoint
             contract_address: Address of the contract to benchmark
-            private_key: Your wallet private key for signing transactions
+            private_key: Your wallet private key for signing transactions (optional)
+            chain_config: GenLayer chain configuration (defaults to testnet_asimov)
         """
-        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+        # Use testnet_asimov as default if no chain config provided
+        self.chain_config = chain_config or testnet_asimov
+        
+        # Create GenLayer client
+        self.client = create_client(chain=self.chain_config)
+        
+        # Create account from private key if provided
+        if private_key:
+            self.account = create_account(account_private_key=private_key)
+            # Update client with account
+            self.client = create_client(chain=self.chain_config, account=self.account)
+        else:
+            self.account = None
+        
         self.contract_address = contract_address
-        self.account = self.w3.eth.account.from_key(private_key)
         self.results = []
         
-    def execute_contract(self, method_name: str, params: List[Any] = None) -> Dict:
+    def execute_contract(self, method_name: str, params: List[Any] = None, is_read: bool = False) -> Dict:
         """
         Execute a single contract call and measure performance
+        
+        Args:
+            method_name: Name of the contract method to call
+            params: Parameters to pass to the method
+            is_read: If True, performs a read-only call (no transaction)
         
         Returns:
             Dictionary with execution metrics
@@ -52,44 +69,60 @@ class IntelligentContractBenchmark:
         start_time = time.time()
         
         try:
-            # Prepare transaction
-            nonce = self.w3.eth.get_transaction_count(self.account.address)
-            
-            # Build transaction (adjust based on Gen Layer's actual interface)
-            transaction = {
-                'from': self.account.address,
-                'to': self.contract_address,
-                'nonce': nonce,
-                'gas': 2000000,
-                'gasPrice': self.w3.eth.gas_price,
-                'data': self._encode_method_call(method_name, params)
-            }
-            
-            # Sign and send
-            signed_txn = self.w3.eth.account.sign_transaction(transaction, self.account.key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
-            
-            # Wait for receipt
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
-            
-            end_time = time.time()
-            
-            # Calculate metrics
-            execution_time = (end_time - start_time) * 1000  # Convert to ms
-            gas_used = receipt['gasUsed']
-            success = receipt['status'] == 1
-            
-            result = {
-                'timestamp': datetime.now().isoformat(),
-                'method': method_name,
-                'execution_time_ms': execution_time,
-                'gas_used': gas_used,
-                'success': success,
-                'tx_hash': tx_hash.hex(),
-                'block_number': receipt['blockNumber']
-            }
-            
-            return result
+            if is_read:
+                # Read-only contract call (no transaction)
+                result_data = self.client.read_contract(
+                    address=self.contract_address,
+                    function_name=method_name,
+                    args=params or []
+                )
+                
+                end_time = time.time()
+                execution_time = (end_time - start_time) * 1000
+                
+                return {
+                    'timestamp': datetime.now().isoformat(),
+                    'method': method_name,
+                    'execution_time_ms': execution_time,
+                    'gas_used': 0,  # Read calls don't use gas
+                    'success': True,
+                    'tx_hash': None,
+                    'block_number': None,
+                    'result': str(result_data)
+                }
+            else:
+                # Write contract call (creates a transaction)
+                if not self.account:
+                    raise ValueError("Account required for write operations")
+                
+                # Write contract call using GenLayer SDK
+                tx_hash = self.client.write_contract(
+                    address=self.contract_address,
+                    function_name=method_name,
+                    args=params or [],
+                    account=self.account
+                )
+                
+                # Get transaction details
+                tx = self.client.get_transaction(tx_hash)
+                
+                end_time = time.time()
+                execution_time = (end_time - start_time) * 1000
+                
+                # Extract gas used from transaction if available
+                gas_used = getattr(tx, 'gas_used', 0) if hasattr(tx, 'gas_used') else 0
+                
+                result = {
+                    'timestamp': datetime.now().isoformat(),
+                    'method': method_name,
+                    'execution_time_ms': execution_time,
+                    'gas_used': gas_used,
+                    'success': True,
+                    'tx_hash': tx_hash.hex() if hasattr(tx_hash, 'hex') else str(tx_hash),
+                    'block_number': getattr(tx, 'block_number', None) if hasattr(tx, 'block_number') else None
+                }
+                
+                return result
             
         except Exception as e:
             end_time = time.time()
@@ -102,17 +135,16 @@ class IntelligentContractBenchmark:
                 'error': str(e)
             }
     
-    def _encode_method_call(self, method_name: str, params: List[Any]) -> bytes:
+    def get_contract_schema(self):
         """
-        Encode method call - adjust based on Gen Layer's actual ABI
+        Get the contract schema/ABI for the contract
         """
-        # This is a placeholder - you'll need to adjust based on actual Gen Layer interface
-        # For now, we'll use a simple encoding
-        call_data = json.dumps({
-            'method': method_name,
-            'params': params or []
-        })
-        return call_data.encode()
+        try:
+            schema = self.client.get_contract_schema(self.contract_address)
+            return schema
+        except Exception as e:
+            print(f"Warning: Could not retrieve contract schema: {e}")
+            return None
     
     def run_benchmark(self, method_name: str, params: List[Any] = None, 
                      iterations: int = 100, warmup: int = 5) -> Dict:
@@ -309,23 +341,22 @@ def main():
     
     # Configuration - UPDATE THESE WITH YOUR ACTUAL VALUES
     config = {
-        'rpc_url': 'https://genlayer-testnet.rpc.caldera.xyz/http',  # Replace with actual RPC
-        'contract_address': '0xed7f2512f57e4d6c314c886755b231d5f13449189aad69bcfb95225f832f43cc',  # Replace with your contract address
-        'private_key': 'edskRn8esXg8GK6vamHd2MX489jsEP8Y8YUGnoQyBNQQmxECyhxJMNQysG3ktM9M4fQA8L2vb6KJ6PAbVofiVznRmA2FE3k62R'  # Replace with your private key
+        'contract_address': '0xbc88344eb9a1f9362d6181cd8d716218d083c5964743f18557554c369fd45717',  # Replace with your contract address
+        'private_key': 'edskRn8esXg8GK6vamHd2MX489jsEP8Y8YUGnoQyBNQQmxECyhxJMNQysG3ktM9M4fQA8L2vb6KJ6PAbVofiVznRmA2FE3k62R'  # Replace with your private key (optional for read-only operations)
     }
     
     print("⚠️  CONFIGURATION REQUIRED")
     print("Please update the config dictionary with:")
-    print("  - Gen Layer testnet RPC URL")
     print("  - Your deployed contract address")
-    print("  - Your wallet private key")
-    print("\nThis is a template - adapt it to Gen Layer's actual API\n")
+    print("  - Your wallet private key (optional, required only for write operations)")
+    print("\nUsing GenLayer Asimov Testnet by default")
+    print("Chain ID: 4221")
+    print("RPC URL: http://34.32.169.58:9151\n")
     
     # Initialize benchmark
     # benchmark = IntelligentContractBenchmark(
-    #     rpc_url=config['rpc_url'],
     #     contract_address=config['contract_address'],
-    #     private_key=config['private_key']
+    #     private_key=config['private_key']  # Optional, omit for read-only operations
     # )
     
     # Example benchmark tests
@@ -350,7 +381,7 @@ def main():
     print("\n" + "="*60)
     print("NEXT STEPS TO USE THIS TOOL:")
     print("="*60)
-    print("\n1. Install Gen Layer SDK/tools")
+    print("\n1. ✓ Gen Layer SDK/tools installed")
     print("2. Get testnet tokens from faucet")
     print("3. Deploy test contracts to testnet")
     print("4. Update config with your contract details")
